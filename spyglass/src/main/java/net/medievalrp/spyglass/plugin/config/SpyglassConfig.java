@@ -60,7 +60,8 @@ public record SpyglassConfig(
                 String.valueOf(key),
                 new EventSettings(
                         value.node("enabled").getBoolean(true),
-                        value.node("past-tense").getString(String.valueOf(key)))));
+                        value.node("past-tense").getString(String.valueOf(key)),
+                        readEventRetention(value, String.valueOf(key), plugin.getLogger()))));
 
         java.util.List<String> commandRedact = parseCommandRedact(root);
 
@@ -97,10 +98,11 @@ public record SpyglassConfig(
                                 root.node("database", "mariadb", "password").getString(""),
                                 root.node("database", "mariadb", "ssl").getBoolean(false))),
                 new Storage(
-                        Duration.parse(root.node("storage", "retention").getString("4w")),
+                        Duration.parse(root.node("storage", "retention").getString("26w")),
                         root.node("storage", "queue-capacity").getInt(100_000),
                         root.node("storage", "queue-max").getInt(500_000),
                         root.node("storage", "spill-to-disk").getBoolean(true),
+                        root.node("storage", "spill-drain-rate").getInt(20_000),
                         Duration.parse(root.node("storage", "flush-timeout").getString("5s")),
                         parseDurability(root.node("storage", "durability").getString("ram")),
                         "synthesized".equalsIgnoreCase(
@@ -183,7 +185,7 @@ public record SpyglassConfig(
     }
 
     public boolean enabled(String eventName) {
-        return events.getOrDefault(eventName, new EventSettings(false, eventName)).enabled();
+        return events.getOrDefault(eventName, new EventSettings(false, eventName, null)).enabled();
     }
 
     public String pastTense(String eventName) {
@@ -309,6 +311,15 @@ public record SpyglassConfig(
      *                      WorldEdit paste heap-flat without dropping records:
      *                      the drain replays spilled segments. Requires
      *                      {@code queueMax > 0}; needs a fast local disk.
+     * @param spillDrainRate cap, in records/sec, on how fast the drain reclaims
+     *                      the on-disk spill backlog in the background (#180). The
+     *                      drain replays spilled segments using spare capacity (it
+     *                      keeps live events fresh and pauses while the queue is at
+     *                      the ceiling) but no faster than this, so reclaiming a
+     *                      large backlog never saturates the store on a live
+     *                      server. {@code 0} = unlimited (drain as fast as the
+     *                      store accepts); raise it or set 0 during a maintenance
+     *                      window to recover a big backlog faster.
      * @param flushTimeout  upper bound on how long {@code onDisable} will
      *                      wait for the queue to drain before returning.
      * @param durability    how aggressive the write path is about
@@ -326,7 +337,7 @@ public record SpyglassConfig(
      *                      cheap; per-event overhead is negligible.
      */
     public record Storage(Duration retention, int queueCapacity, int queueMax,
-                          boolean spillToDisk, Duration flushTimeout,
+                          boolean spillToDisk, int spillDrainRate, Duration flushTimeout,
                           Durability durability, boolean rolledAuditSynthesized) {
     }
 
@@ -350,6 +361,66 @@ public record SpyglassConfig(
         WAL_BATCHED
     }
 
+    /**
+     * Read an event node's {@code retention} value and parse it (#181, #185).
+     *
+     * <p>The value is fetched with the no-arg {@link ConfigurationNode#getString()}.
+     * Configurate's {@code getString(String)} overload runs {@code requireNonNull}
+     * on the supplied default, so {@code getString(null)} threw a
+     * {@code NullPointerException} ("Failed to load config: def") on every config
+     * whose events omit {@code retention} - which is the bundled default for all of
+     * them, so 1.0.5 failed to enable everywhere. The nullable read returns
+     * {@code null} for a missing key, which {@link #parseEventRetention} treats as
+     * inherit-the-global. Kept package-visible so the absent-key path is unit-tested
+     * without standing up a full plugin.
+     */
+    static Long readEventRetention(ConfigurationNode eventNode, String event,
+            java.util.logging.Logger logger) {
+        return parseEventRetention(eventNode.node("retention").getString(), event, logger);
+    }
+
+    /**
+     * Parse a per-event {@code events.<name>.retention} value (#181) into seconds.
+     * {@code null}/blank -> inherit the global default; {@code "0"}/{@code "never"}/
+     * {@code "forever"}/{@code "off"} -> keep forever; otherwise a duration like
+     * {@code "12w"}. An unparseable value warns and falls back to the global default.
+     */
+    static Long parseEventRetention(String raw, String event, java.util.logging.Logger logger) {
+        if (raw == null) {
+            return null; // inherit storage.retention
+        }
+        String v = raw.trim().toLowerCase(java.util.Locale.ROOT);
+        if (v.isEmpty()) {
+            return null;
+        }
+        if (v.equals("0") || v.equals("never") || v.equals("forever") || v.equals("off")) {
+            return net.medievalrp.spyglass.plugin.storage.RetentionPolicy.NEVER_SECONDS;
+        }
+        try {
+            return Duration.parse(raw).seconds();
+        } catch (RuntimeException ex) {
+            logger.warning("Spyglass: invalid retention \"" + raw + "\" for event '"
+                    + event + "'; inheriting the global storage.retention. (" + ex.getMessage() + ")");
+            return null;
+        }
+    }
+
+    /**
+     * Per-event retention policy (#181): the global {@code storage.retention} as
+     * the default, with overrides for every event that set its own
+     * {@code retention}. Consumed by the active {@code RecordStore}.
+     */
+    public net.medievalrp.spyglass.plugin.storage.RetentionPolicy retentionPolicy() {
+        Map<String, Long> overrides = new LinkedHashMap<>();
+        events.forEach((name, settings) -> {
+            if (settings.retentionSeconds() != null) {
+                overrides.put(name, settings.retentionSeconds());
+            }
+        });
+        return new net.medievalrp.spyglass.plugin.storage.RetentionPolicy(
+                storage.retention().seconds(), overrides);
+    }
+
     private static Durability parseDurability(String raw) {
         String key = raw == null ? "" : raw.trim().toLowerCase(java.util.Locale.ROOT).replace('-', '_');
         return switch (key) {
@@ -368,7 +439,14 @@ public record SpyglassConfig(
                          long rollbackTickBudgetMs) {
     }
 
-    public record EventSettings(boolean enabled, String pastTense) {
+    /**
+     * @param retentionSeconds per-event retention override in seconds (#181), or
+     *                         {@code null} to inherit the global
+     *                         {@code storage.retention}. {@link
+     *                         net.medievalrp.spyglass.plugin.storage.RetentionPolicy#NEVER_SECONDS}
+     *                         marks a "keep forever" type.
+     */
+    public record EventSettings(boolean enabled, String pastTense, Long retentionSeconds) {
     }
 
     public record Tool(Material material) {

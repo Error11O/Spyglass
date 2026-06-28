@@ -5,6 +5,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
+import java.util.logging.Level;
 import java.util.stream.Collectors;
 import net.medievalrp.spyglass.api.SpyglassApi;
 import net.medievalrp.spyglass.api.SpyglassLimits;
@@ -193,17 +194,21 @@ public final class SpyglassPlugin extends JavaPlugin {
         try {
             config = SpyglassConfig.load(this);
         } catch (Exception ex) {
-            getLogger().severe("Failed to load config: " + ex.getMessage());
+            getLogger().log(Level.SEVERE, "Failed to load config. Disabling the plugin.", ex);
             setEnabled(false);
             return;
         }
 
+        // Per-event-type retention (#181): global storage.retention as the
+        // default, with per-event overrides. Drives every backend's expiry.
+        net.medievalrp.spyglass.plugin.storage.RetentionPolicy retentionPolicy =
+                config.retentionPolicy();
         try {
             switch (config.database().backend()) {
                 case MONGO -> {
                     SpyglassConfig.Database db = config.database();
                     MongoRecordStore mongoStore = new MongoRecordStore(
-                            db.uri(), db.name(), db.collection(), new IndexManager());
+                            db.uri(), db.name(), db.collection(), new IndexManager(), retentionPolicy);
                     recordStore = mongoStore;
                     undoStack = new MongoUndoStack(
                             mongoStore.database(), mongoStore.codecRegistry());
@@ -216,7 +221,7 @@ public final class SpyglassPlugin extends JavaPlugin {
                     SpyglassConfig.ClickHouse ch = config.database().clickhouse();
                     ClickHouseRecordStore chStore = new ClickHouseRecordStore(
                             ch.host(), ch.port(), ch.database(), ch.table(),
-                            ch.user(), ch.password(), ch.ssl());
+                            ch.user(), ch.password(), ch.ssl(), retentionPolicy);
                     recordStore = chStore;
                     undoStack = new ClickHouseUndoStack(
                             chStore.client(), ch.database());
@@ -237,7 +242,7 @@ public final class SpyglassPlugin extends JavaPlugin {
                     // expiry on column-stored rows (which don't carry an
                     // expires_at column).
                     SqliteRecordStore sqliteStore = new SqliteRecordStore(
-                            dbPath, false, config.storage().retention().seconds());
+                            dbPath, false, retentionPolicy);
                     recordStore = sqliteStore;
                     undoStack = new SqliteUndoStack(sqliteStore);
                     toolStateStore = new SqliteToolStateStore(sqliteStore);
@@ -252,7 +257,7 @@ public final class SpyglassPlugin extends JavaPlugin {
                     MariaDbRecordStore mariaStore = new MariaDbRecordStore(
                             maria.host(), maria.port(), maria.database(),
                             maria.user(), maria.password(), maria.ssl(),
-                            config.storage().retention().seconds());
+                            retentionPolicy);
                     recordStore = mariaStore;
                     undoStack = new MariaDbUndoStack(mariaStore);
                     toolStateStore = new MariaDbToolStateStore(mariaStore);
@@ -311,6 +316,9 @@ public final class SpyglassPlugin extends JavaPlugin {
         recorder = new AsyncRecorder(
                 config.storage().queueCapacity(), config.storage().queueMax(),
                 recordStore, wal, spill, Bukkit::isPrimaryThread, getLogger());
+        // #180: cap how fast the drain reclaims a large on-disk spill backlog in
+        // the background, so it never saturates the store on a live server.
+        recorder.setSpillDrainRate(config.storage().spillDrainRate());
         // Publish RecordCommittedEvent to Bukkit listeners on every
         // intake. Done via a hook (rather than a direct Bukkit call
         // inside AsyncRecorder) so the recorder stays unit-testable
@@ -608,7 +616,7 @@ public final class SpyglassPlugin extends JavaPlugin {
                 salvageStore, salvageGui, config.limits().searchResult(), serviceSupport);
         // #168: /spyglass stats. Null ingestStats (analytics off) => the command
         // explains how to enable it.
-        StatsService statsService = new StatsService(ingestStats);
+        StatsService statsService = new StatsService(ingestStats, recorder::spillSnapshot);
 
         SpyglassCommands commands = new SpyglassCommands(
                 this,

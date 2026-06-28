@@ -10,6 +10,57 @@ import org.spongepowered.configurate.serialize.SerializationException;
 
 class SpyglassConfigTest {
 
+    private static final java.util.logging.Logger LOG =
+            java.util.logging.Logger.getLogger("test");
+
+    @Test
+    void absentPerEventRetentionInheritsTheGlobal() {
+        assertThat(SpyglassConfig.parseEventRetention(null, "break", LOG)).isNull();
+        assertThat(SpyglassConfig.parseEventRetention("", "break", LOG)).isNull();
+    }
+
+    @Test
+    void perEventRetentionParsesDurations() {
+        assertThat(SpyglassConfig.parseEventRetention("3d", "say", LOG))
+                .isEqualTo(3L * 24 * 60 * 60);
+        assertThat(SpyglassConfig.parseEventRetention("12w", "break", LOG))
+                .isEqualTo(12L * 7 * 24 * 60 * 60);
+    }
+
+    @Test
+    void keepForeverKeywordsMapToNever() {
+        Long never = net.medievalrp.spyglass.plugin.storage.RetentionPolicy.NEVER_SECONDS;
+        assertThat(SpyglassConfig.parseEventRetention("0", "command", LOG)).isEqualTo(never);
+        assertThat(SpyglassConfig.parseEventRetention("never", "command", LOG)).isEqualTo(never);
+        assertThat(SpyglassConfig.parseEventRetention("forever", "command", LOG)).isEqualTo(never);
+    }
+
+    @Test
+    void invalidPerEventRetentionFallsBackToTheGlobal() {
+        // Unparseable -> warn + null (inherit), never a crash.
+        assertThat(SpyglassConfig.parseEventRetention("banana", "say", LOG)).isNull();
+    }
+
+    // #185: 1.0.5 read events.<name>.retention with getString(null), which NPEs in
+    // Configurate ("Failed to load config: def") because no bundled event sets the
+    // key. parseEventRetention(null, ...) above can't catch that - it's the read,
+    // not the parse, that threw. These drive the real read path over a live node, so
+    // a revert to the throwing overload fails here instead of only on a live server.
+    @Test
+    void eventNodeWithoutRetentionReadsAsInheritNotACrash() {
+        BasicConfigurationNode event = BasicConfigurationNode.root();
+        // 'retention' deliberately absent - the default for every bundled event.
+        assertThat(SpyglassConfig.readEventRetention(event, "break", LOG)).isNull();
+    }
+
+    @Test
+    void eventNodeWithRetentionReadsTheOverride() throws SerializationException {
+        BasicConfigurationNode event = BasicConfigurationNode.root();
+        event.node("retention").set("3d");
+        assertThat(SpyglassConfig.readEventRetention(event, "say", LOG))
+                .isEqualTo(3L * 24 * 60 * 60);
+    }
+
     @Test
     void absentRedactKeyFallsBackToDefaultAuthSet() throws SerializationException {
         BasicConfigurationNode root = BasicConfigurationNode.root();
