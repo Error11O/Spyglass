@@ -175,23 +175,3 @@ tasks.register<Test>("clickhouseBench") {
         }
     }
 }
-
-publishing {
-    publications {
-        create<MavenPublication>("core") {
-            from(components["java"])
-            groupId = "net.medievalrp"
-            artifactId = "spyglass-core"
-            pom {
-                name.set("Spyglass Core")
-                description.set("Shared storage codecs and record-store backends for the Spyglass forensics plugin.")
-                url.set("https://github.com/medievalrp-net/Spyglass")
-                licenses {
-                    license {
-                        name.set("GNU General Public License v3.0")
-                    }
-                }
-            }
-        }
-    }
-}
